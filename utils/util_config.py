@@ -20,7 +20,9 @@ DEFAULT_CONFIG = {
     "renamer": {
         "video_extensions": [".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".ts"],
         "movie_format": "[MOVIE_NAME] ([YEAR]) [[IMDB_ID]] - [RESOLUTION]",
-        "show_format": "[SHOW_NAME] - S[SEASON]E[EPISODE] - [EPISODE_NAME]"
+        "show_format": "[SHOW_NAME] - S[SEASON]E[EPISODE] - [EPISODE_NAME]",
+        "show_folder_format": "[SHOW_NAME] [[IMDB_ID]] - [RESOLUTION]",
+        "season_folder_format": "Staffel [SEASON]"
     }
 }
 
@@ -43,6 +45,10 @@ def load_config():
                     config["renamer"]["movie_format"] = DEFAULT_CONFIG["renamer"]["movie_format"]
                 if "show_format" not in config["renamer"]:
                     config["renamer"]["show_format"] = DEFAULT_CONFIG["renamer"]["show_format"]
+                if "show_folder_format" not in config["renamer"]:
+                    config["renamer"]["show_folder_format"] = DEFAULT_CONFIG["renamer"]["show_folder_format"]
+                if "season_folder_format" not in config["renamer"]:
+                    config["renamer"]["season_folder_format"] = DEFAULT_CONFIG["renamer"]["season_folder_format"]
                 if "video_extensions" not in config["renamer"]:
                     config["renamer"]["video_extensions"] = DEFAULT_CONFIG["renamer"]["video_extensions"]
             

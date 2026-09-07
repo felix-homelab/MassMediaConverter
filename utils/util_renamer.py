@@ -255,19 +255,25 @@ def search_movie_suggestion(title, year=None, kind_priority='feature'):
         return None
 
 
-def rename_file(file_path, out_title, log_file):
+def rename_file(file_path, out_title, log_file, dest_dir=None):
     # Sanitize filename to remove illegal characters
     out_title = re.sub(r'[<>:"/\\|?*]', '', out_title)
-    
-    out_path = file_path.with_name(out_title)
+
+    if dest_dir is not None:
+        out_path = dest_dir / out_title
+        display_name = f"{dest_dir.parent.name}/{dest_dir.name}/{out_title}"
+    else:
+        out_path = file_path.with_name(out_title)
+        display_name = out_title
+
     try:
         file_path.rename(out_path)
 
-        log_entry = f"{out_title}\n"
+        log_entry = f"{display_name}\n"
         log_file.write(log_entry)
         log_file.flush()  # Ensure it's written to disk immediately
 
-        console.print(Panel(f"[bold green]{escape(out_title)}[/bold green]", title="Renamed Success", border_style="green"))
+        console.print(Panel(f"[bold green]{escape(display_name)}[/bold green]", title="Renamed Success", border_style="green"))
     except OSError as e:
         console.print(f"[bold red]Error renaming file: {e}[/bold red]")
 
@@ -297,6 +303,36 @@ def format_show_name(format_str, show_name, season, episode, episode_name, resol
                      .replace("[YEAR]", year_val)\
                      .replace("[SHOW_YEAR]", year_val)\
                      .replace("[EPISODE_YEAR]", ep_year_val)
+
+def build_show_folder(base_dir, show_name, imdb_id, season, episode, resolution, current_config):
+    """
+    Create and return the destination folder for a TV show episode,
+    e.g. "Dexter [tt0773262] - 1080p/Staffel 01".
+    """
+    folder_fmt = current_config['renamer'].get('show_folder_format', "[SHOW_NAME] [[IMDB_ID]] - [RESOLUTION]")
+    season_fmt = current_config['renamer'].get('season_folder_format', "Staffel [SEASON]")
+
+    def fill(fmt):
+        return fmt.replace("[SHOW_NAME]", show_name)\
+                  .replace("[SEASON]", f"{season:02d}")\
+                  .replace("[EPISODE]", f"{episode:02d}")\
+                  .replace("[RESOLUTION]", resolution)\
+                  .replace("[IMDB_ID]", imdb_id)
+
+    folder_name = fill(folder_fmt)
+    season_name = fill(season_fmt)
+
+    # Skip an unknown resolution in the folder name
+    if resolution == "Unknown":
+        folder_name = re.sub(r'\s*-\s*Unknown\s*$', '', folder_name)
+
+    # Sanitize folder names to remove illegal characters
+    folder_name = re.sub(r'[<>:"/\\|?*]', '', folder_name)
+    season_name = re.sub(r'[<>:"/\\|?*]', '', season_name)
+
+    dest_dir = base_dir / folder_name / season_name
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    return dest_dir
 
 def check_similarity(name1, name2):
     """
@@ -487,18 +523,21 @@ def process_file(file_path, log_file, current_config):
              if series_title:
                  series_title = series_title.replace(":", "-")
 
+             # Sort episodes into a show folder with a season subfolder
+             dest_dir = build_show_folder(file_path.parent, series_title, imdb_id, season, episode, res_category, current_config)
+
              if ep_title:
                  # Construct TV Show filename
                  show_fmt = current_config['renamer'].get('show_format', "[SHOW_NAME] - S[SEASON]E[EPISODE] - [EPISODE_NAME]")
                  out_title = format_show_name(show_fmt, series_title, season, episode, ep_title, res_category, imdb_id, show_year, episode_year) + file_path.suffix
-                 rename_file(file_path, out_title, log_file)
+                 rename_file(file_path, out_title, log_file, dest_dir)
              else:
                  console.print("[bold yellow]Could not fetch episode details.[/bold yellow]")
                  # Fallback: Rename without episode title if episode info is missing
                  # User might prefer this over skipping
                  fallback_title = f"{series_title} - S{season:02d}E{episode:02d} - Unknown Episode{file_path.suffix}"
                  console.print(f"Renaming with fallback title: {escape(fallback_title)}")
-                 rename_file(file_path, fallback_title, log_file)
+                 rename_file(file_path, fallback_title, log_file, dest_dir)
 
         else:
             # Movie: reuse title/year from the selected suggestion when available,
