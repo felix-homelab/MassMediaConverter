@@ -4,7 +4,6 @@ import requests
 import urllib.parse
 from pathlib import Path
 import pyperclip
-from imdb import IMDb
 from difflib import SequenceMatcher
 from rich.console import Console
 from rich.prompt import Prompt
@@ -16,14 +15,8 @@ from rich import box
 from rich.markup import escape
 from utils.util_config import load_config
 from utils.util_resolution import *
-import logging
-import time
-
-# Suppress imdbpy logging
-logging.getLogger('imdbpy').setLevel(logging.CRITICAL + 1)
 
 console = Console()
-ia = IMDb()
 
 # Load config
 VIDEO_EXTENSIONS = set(load_config()['renamer']['video_extensions'])
@@ -34,27 +27,51 @@ SHOW_CACHE = {}
 
 def get_movie_info(imdb_id):
     """
-    Fetch movie information from IMDb using IMDbPY library.
+    Fetch movie title and release year by IMDb ID using Wikidata (P345).
+    Returns (title, year_str). Either can be None on failure.
     """
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            # Remove 'tt' prefix if present and get movie object
-            movie_id = imdb_id.replace("tt", "")
-            movie = ia.get_movie(movie_id)
+    try:
+        tt_id = imdb_id if imdb_id.startswith('tt') else f"tt{imdb_id}"
 
-            original_title = movie.get('title', 'Unknown').replace(":", "-")
-            release_year = str(movie.get('year', 'Unknown'))
+        # P577 (publication date) covers films; P580 (start time) covers TV series
+        query = (
+            "SELECT ?itemLabel (MIN(?y) AS ?minYear) WHERE { "
+            f'?item wdt:P345 "{tt_id}". '
+            "OPTIONAL { ?item wdt:P577 ?date. BIND(YEAR(?date) AS ?year) } "
+            "OPTIONAL { ?item wdt:P580 ?startDate. BIND(YEAR(?startDate) AS ?startYear) } "
+            "BIND(COALESCE(?year, ?startYear) AS ?y) "
+            'SERVICE wikibase:label { bd:serviceParam wikibase:language "en". } '
+            "} "
+            "GROUP BY ?item ?itemLabel "
+            "LIMIT 1"
+        )
 
-            return original_title, release_year
+        response = requests.get(
+            'https://query.wikidata.org/sparql',
+            params={'query': query, 'format': 'json'},
+            headers={'User-Agent': 'MassMediaConverter/1.0 (personal media tool)'},
+            timeout=15,
+        )
+        response.raise_for_status()
 
-        except Exception as e:
-            if attempt < max_retries - 1:
-                # console.print(f"[yellow]Connection error ({e}). Retrying... ({attempt + 1}/{max_retries})[/yellow]")
-                time.sleep(1)
-                continue
-            console.print(f"[bold red]Error fetching movie info: {e}[/bold red]")
+        bindings = response.json().get('results', {}).get('bindings', [])
+        if not bindings:
             return None, None
+
+        row = bindings[0]
+        title = row.get('itemLabel', {}).get('value')
+        year = row.get('minYear', {}).get('value')
+
+        if title:
+            # Strip Wikidata disambiguators like "Inception (2010 film)"
+            title = re.sub(r'\s*\([^)]*\)\s*$', '', title)
+            title = title.replace(":", "-")
+
+        return title, year
+
+    except Exception as e:
+        console.print(f"[bold red]Error fetching movie info: {e}[/bold red]")
+        return None, None
 
 
 def get_episode_info(imdb_series_id, season_num, episode_num):
@@ -332,6 +349,7 @@ def process_file(file_path, log_file, current_config):
 
     # Check cache for TV shows
     imdb_id = None
+    selected_suggestion = None
     if is_tv_show:
         cache_key = (tv_title.lower(), season)
         if cache_key in SHOW_CACHE:
@@ -371,7 +389,7 @@ def process_file(file_path, log_file, current_config):
                     console.print(f"Filename suggests: {name_to_compare}")
                     console.print(f"ID {existing_imdb_id} is: {fetched_title} ({fetched_year})")
                     
-                    choice = Prompt.ask("[bold yellow]Use ID from filename (1) or Search by Name (1)?[/bold yellow]", choices=["1", "2"], default="1")
+                    choice = Prompt.ask("[bold yellow]Use ID from filename (1) or Search by Name (2)?[/bold yellow]", choices=["1", "2"], default="1")
                     if choice == "1":
                         imdb_id = existing_imdb_id
                     else:
@@ -425,10 +443,12 @@ def process_file(file_path, log_file, current_config):
 
         # Determine which ID to use
         if not user_input and top_suggestion:
+            selected_suggestion = top_suggestion
             imdb_id = f"tt{top_suggestion['movieID']}"
         elif user_input.isdigit():
             idx = int(user_input) - 1
             if suggestions and 0 <= idx < len(suggestions):
+                selected_suggestion = suggestions[idx]
                 imdb_id = f"tt{suggestions[idx]['movieID']}"
             else:
                 console.print("[bold red]Invalid selection.[/bold red]")
@@ -481,8 +501,19 @@ def process_file(file_path, log_file, current_config):
                  rename_file(file_path, fallback_title, log_file)
 
         else:
-            with console.status("[bold yellow]Fetching Movie Info...[/bold yellow]", spinner="dots"):
-                original_title, release_year = get_movie_info(imdb_id)
+            # Movie: reuse title/year from the selected suggestion when available,
+            # otherwise look the ID up via Wikidata.
+            original_title = release_year = None
+            if selected_suggestion:
+                original_title = selected_suggestion.get('title')
+                release_year = selected_suggestion.get('year')
+
+            if not (original_title and release_year):
+                with console.status("[bold yellow]Fetching Movie Info...[/bold yellow]", spinner="dots"):
+                    original_title, release_year = get_movie_info(imdb_id)
+
+            if original_title:
+                original_title = original_title.replace(":", "-")
 
             if original_title and release_year:
                 # Construct the new filename
