@@ -7,12 +7,15 @@ from rich.prompt import Prompt
 from rich.align import Align
 from rich.markup import escape
 from utils.util_colors import clear_screen
+from utils.util_editions import normalize_edition_key
 
 console = Console()
 
 CONFIG_FILE = 'settings/config.json'
+CONFIG_VERSION = 2
 
 DEFAULT_CONFIG = {
+    "config_version": CONFIG_VERSION,
     "paths": {
         # All paths are relative to the folder the app is started from (the project root).
         "renamer_input": ".",
@@ -32,12 +35,13 @@ DEFAULT_CONFIG = {
     "renamer": {
         "video_extensions": [".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".ts"],
         "sidecar_extensions": [".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".nfo", ".jpg", ".jpeg", ".png", ".webp"],
-        "movie_format": "[MOVIE_NAME] ([YEAR]) [[IMDB_ID]] - [RESOLUTION]",
-        "show_format": "[SHOW_NAME] - S[SEASON]E[EPISODE] - [EPISODE_NAME]",
+        "movie_format": "[MOVIE_NAME] ([YEAR]) [[IMDB_ID]] - [EDITION] - [RESOLUTION]",
+        "show_format": "[SHOW_NAME] - S[SEASON]E[EPISODE] - [EPISODE_NAME] - [EDITION]",
         "show_folder_format": "[SHOW_NAME] [[IMDB_ID]] - [RESOLUTION]",
         "season_folder_format": "Staffel [SEASON]",
         "folder_mode": "show_folders",  # Options: show_folders, flat
-        "collision_suffix": " ({n})"
+        "collision_suffix": " ({n})",
+        "edition_tags": ["Director's Cut", "Extended", "Remastered", "Uncut"]
     }
 }
 
@@ -56,6 +60,17 @@ def _deep_merge(defaults, loaded):
     return result
 
 
+def _insert_edition_placeholder(format_str):
+    """Add [EDITION] to a legacy format string exactly once."""
+    if '[EDITION]' in format_str:
+        return format_str
+    if not format_str.strip():
+        return '[EDITION]'
+    if '[RESOLUTION]' in format_str:
+        return format_str.replace('[RESOLUTION]', '[EDITION] - [RESOLUTION]', 1)
+    return format_str.rstrip(' -') + ' - [EDITION]'
+
+
 def _migrate_config(config):
     """Move keys from older config layouts to their current location."""
     converter = config.get('converter')
@@ -68,6 +83,36 @@ def _migrate_config(config):
                 if key not in renamer:
                     renamer[key] = converter[key]
                 del converter[key]
+
+    # v2 introduced the [EDITION] placeholder. Insert it once into formats
+    # from older configs; removing it later is respected because the version
+    # is already at CONFIG_VERSION.
+    version = config.get('config_version', 1)
+    if not isinstance(version, int) or version < CONFIG_VERSION:
+        if isinstance(renamer, dict):
+            for key in ('movie_format', 'show_format'):
+                fmt = renamer.get(key)
+                if isinstance(fmt, str):
+                    renamer[key] = _insert_edition_placeholder(fmt)
+        config['config_version'] = CONFIG_VERSION
+
+
+def _normalize_edition_tags(values):
+    if not isinstance(values, list):
+        return list(DEFAULT_CONFIG['renamer']['edition_tags'])
+
+    result = []
+    seen = set()
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        value = " ".join(value.split())
+        key = normalize_edition_key(value)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result
 
 
 def _normalize_extensions(values):
@@ -88,12 +133,24 @@ def _normalize_extensions(values):
 
 def _validate_config(config):
     """Clamp/normalize values that would otherwise break the pipeline."""
+    version = config.get('config_version')
+    if not isinstance(version, int) or version < CONFIG_VERSION:
+        config['config_version'] = CONFIG_VERSION
     renamer = config.setdefault('renamer', {})
     converter = config.setdefault('converter', {})
     paths = config.setdefault('paths', {})
 
     renamer['video_extensions'] = _normalize_extensions(renamer.get('video_extensions', []))
     renamer['sidecar_extensions'] = _normalize_extensions(renamer.get('sidecar_extensions', []))
+
+    if 'edition_tags' not in renamer:
+        renamer['edition_tags'] = list(DEFAULT_CONFIG['renamer']['edition_tags'])
+    else:
+        renamer['edition_tags'] = _normalize_edition_tags(renamer['edition_tags'])
+
+    for key in ('movie_format', 'show_format', 'show_folder_format', 'season_folder_format'):
+        if not isinstance(renamer.get(key), str) or not renamer[key].strip():
+            renamer[key] = DEFAULT_CONFIG['renamer'][key]
 
     if renamer.get('folder_mode') not in ('show_folders', 'flat'):
         renamer['folder_mode'] = 'show_folders'
@@ -204,13 +261,14 @@ def edit_config_menu():
             f"[bold cyan]11.[/bold cyan] Renamer: TV Show Format\n"
             f"[bold cyan]12.[/bold cyan] Renamer: Show Folder Format\n"
             f"[bold cyan]13.[/bold cyan] Renamer: Season Folder Format\n"
-            f"[bold cyan]14.[/bold cyan] Renamer: Folder Mode ([bold green]{renamer['folder_mode']}[/bold green])\n"
-            f"[bold cyan]15.[/bold cyan] Renamer: Collision Suffix ([bold green]{escape(str(renamer['collision_suffix']))}[/bold green])\n"
-            f"[bold cyan]16.[/bold cyan] Paths: Renamer Input ([bold green]{escape(str(paths['renamer_input']))}[/bold green])\n"
-            f"[bold cyan]17.[/bold cyan] Paths: Renamer Output ([bold green]{escape(str(paths['renamer_output']))}[/bold green])\n"
-            f"[bold cyan]18.[/bold cyan] Paths: Converter Input ([bold green]{escape(str(paths['converter_input']))}[/bold green])\n"
-            f"[bold cyan]19.[/bold cyan] Paths: Converter Output ([bold green]{escape(str(paths['converter_output']))}[/bold green])\n"
-            f"[bold yellow]20.[/bold yellow] Save & Back\n"
+            f"[bold cyan]14.[/bold cyan] Renamer: Edition Tags ([bold green]{escape(', '.join(renamer['edition_tags'])) or 'disabled'}[/bold green])\n"
+            f"[bold cyan]15.[/bold cyan] Renamer: Folder Mode ([bold green]{renamer['folder_mode']}[/bold green])\n"
+            f"[bold cyan]16.[/bold cyan] Renamer: Collision Suffix ([bold green]{escape(str(renamer['collision_suffix']))}[/bold green])\n"
+            f"[bold cyan]17.[/bold cyan] Paths: Renamer Input ([bold green]{escape(str(paths['renamer_input']))}[/bold green])\n"
+            f"[bold cyan]18.[/bold cyan] Paths: Renamer Output ([bold green]{escape(str(paths['renamer_output']))}[/bold green])\n"
+            f"[bold cyan]19.[/bold cyan] Paths: Converter Input ([bold green]{escape(str(paths['converter_input']))}[/bold green])\n"
+            f"[bold cyan]20.[/bold cyan] Paths: Converter Output ([bold green]{escape(str(paths['converter_output']))}[/bold green])\n"
+            f"[bold yellow]21.[/bold yellow] Save & Back\n"
         )
 
         panel = Panel(
@@ -235,7 +293,7 @@ def edit_config_menu():
 
         # Center the prompt input cursor roughly
         prompt_padding = " " * max(0, (console.width // 2 - 2))
-        choices = [str(i) for i in range(1, 21)]
+        choices = [str(i) for i in range(1, 22)]
         choice = Prompt.ask(f"{prompt_padding}[bold green]>>>[/bold green]", choices=choices, show_choices=False)
 
         if choice == '1':
@@ -279,13 +337,13 @@ def edit_config_menu():
                 config['renamer']['sidecar_extensions'] = _normalize_extensions(new_exts.split(','))
         elif choice == '10':
             console.print(f"Current Movie Format: [bold green]{renamer['movie_format']}[/bold green]")
-            console.print("Placeholders: [MOVIE_NAME], [YEAR], [IMDB_ID], [RESOLUTION]")
+            console.print("Placeholders: [MOVIE_NAME], [YEAR], [IMDB_ID], [EDITION], [RESOLUTION]")
             new_fmt = Prompt.ask("Enter new movie format")
             if new_fmt:
                 config['renamer']['movie_format'] = new_fmt
         elif choice == '11':
             console.print(f"Current TV Show Format: [bold green]{renamer['show_format']}[/bold green]")
-            console.print("Placeholders: [SHOW_NAME], [SEASON], [EPISODE], [EPISODE_NAME], [RESOLUTION], [SHOW_YEAR], [EPISODE_YEAR]")
+            console.print("Placeholders: [SHOW_NAME], [SEASON], [EPISODE], [EPISODE_NAME], [EDITION], [RESOLUTION], [SHOW_YEAR], [EPISODE_YEAR]")
             new_fmt = Prompt.ask("Enter new TV show format")
             if new_fmt:
                 config['renamer']['show_format'] = new_fmt
@@ -302,26 +360,36 @@ def edit_config_menu():
             if new_fmt:
                 config['renamer']['season_folder_format'] = new_fmt
         elif choice == '14':
+            current_tags = ', '.join(renamer['edition_tags']) or 'disabled'
+            console.print(f"Current edition tags: [bold green]{escape(current_tags)}[/bold green]")
+            console.print("Enter comma-separated editions, or 'none' to disable.")
+            console.print("Example: Director's Cut, Extended, Remastered, Uncut")
+            new_tags = Prompt.ask("Edition tags")
+            if new_tags.strip().lower() == 'none':
+                config['renamer']['edition_tags'] = []
+            elif new_tags.strip():
+                config['renamer']['edition_tags'] = [t.strip() for t in new_tags.split(',') if t.strip()]
+        elif choice == '15':
             console.print("Options: [green]show_folders[/green] (Show/Staffel NN/), [green]flat[/green] (everything directly in the output folder)")
             new_mode = Prompt.ask("Enter folder mode", choices=["show_folders", "flat"], default=renamer['folder_mode'])
             config['renamer']['folder_mode'] = new_mode
-        elif choice == '15':
+        elif choice == '16':
             console.print("Placeholder {n} is replaced by the duplicate number, e.g. ' (2)'.")
             config['renamer']['collision_suffix'] = _ask_text(
                 "Enter renamer collision suffix", renamer['collision_suffix'],
                 preserve_space=True)
-        elif choice == '16':
+        elif choice == '17':
             config['paths']['renamer_input'] = _ask_text(
                 "Enter renamer input folder", paths['renamer_input'])
-        elif choice == '17':
+        elif choice == '18':
             config['paths']['renamer_output'] = _ask_text(
                 "Enter renamer output folder", paths['renamer_output'])
-        elif choice == '18':
+        elif choice == '19':
             config['paths']['converter_input'] = _ask_text(
                 "Enter converter input folder", paths['converter_input'])
-        elif choice == '19':
+        elif choice == '20':
             config['paths']['converter_output'] = _ask_text(
                 "Enter converter output folder", paths['converter_output'])
-        elif choice == '20':
+        elif choice == '21':
             save_config(_validate_config(config))
             break

@@ -21,6 +21,7 @@ from rich import box
 from rich.markup import escape
 from utils.util_config import load_config
 from utils.util_resolution import *
+from utils.util_editions import detect_editions
 
 console = Console()
 
@@ -415,32 +416,55 @@ def build_show_folder(output_root, show_name, imdb_id, season, episode, resoluti
     return Path(output_root) / folder_name / season_name
 
 
-def format_movie_name(format_str, movie_name, year, imdb_id, resolution):
+def _clean_optional_segment(text):
+    """Tidy separators left behind by an empty optional placeholder."""
+    text = re.sub(r'\(\s*\)', '', text)
+    text = re.sub(r'\[\s*\]', '', text)
+    text = re.sub(r'(?:\s*-\s*){2,}', ' - ', text)
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    text = re.sub(r'\s+-\s*$', '', text)
+    text = re.sub(r'^\s*-\s+', '', text)
+    return text.strip()
+
+
+def _apply_edition(format_str, edition):
+    if "[EDITION]" not in format_str:
+        return format_str
+    edition = (edition or "").strip()
+    if edition:
+        return format_str.replace("[EDITION]", edition)
+    return _clean_optional_segment(format_str.replace("[EDITION]", ""))
+
+
+def format_movie_name(format_str, movie_name, year, imdb_id, resolution, edition=""):
     """
     Replaces placeholders in the format string with actual movie data.
     """
-    return format_str.replace("[MOVIE_NAME]", movie_name)\
-                     .replace("[YEAR]", year)\
-                     .replace("[IMDB_ID]", imdb_id)\
-                     .replace("[RESOLUTION]", resolution)
+    formatted = format_str.replace("[MOVIE_NAME]", movie_name)\
+                          .replace("[YEAR]", year)\
+                          .replace("[IMDB_ID]", imdb_id)\
+                          .replace("[RESOLUTION]", resolution)
+    return _apply_edition(formatted, edition)
 
-def format_show_name(format_str, show_name, season, episode, episode_name, resolution, imdb_id, show_year, episode_year):
+
+def format_show_name(format_str, show_name, season, episode, episode_name, resolution, imdb_id, show_year, episode_year, edition=""):
     """
     Replaces placeholders in the format string with actual show data.
     """
     # Default [YEAR] to show_year for backward compatibility
     year_val = show_year if show_year else "Unknown"
     ep_year_val = episode_year if episode_year else "Unknown"
-    
-    return format_str.replace("[SHOW_NAME]", show_name)\
-                     .replace("[SEASON]", f"{season:02d}")\
-                     .replace("[EPISODE]", f"{episode:02d}")\
-                     .replace("[EPISODE_NAME]", episode_name)\
-                     .replace("[RESOLUTION]", resolution)\
-                     .replace("[IMDB_ID]", imdb_id)\
-                     .replace("[YEAR]", year_val)\
-                     .replace("[SHOW_YEAR]", year_val)\
-                     .replace("[EPISODE_YEAR]", ep_year_val)
+
+    formatted = format_str.replace("[SHOW_NAME]", show_name)\
+                          .replace("[SEASON]", f"{season:02d}")\
+                          .replace("[EPISODE]", f"{episode:02d}")\
+                          .replace("[EPISODE_NAME]", episode_name)\
+                          .replace("[RESOLUTION]", resolution)\
+                          .replace("[IMDB_ID]", imdb_id)\
+                          .replace("[YEAR]", year_val)\
+                          .replace("[SHOW_YEAR]", year_val)\
+                          .replace("[EPISODE_YEAR]", ep_year_val)
+    return _apply_edition(formatted, edition)
 
 def check_similarity(name1, name2):
     """
@@ -477,9 +501,22 @@ def process_file(file_path, output_root, log_file, current_config):
     console.print(Rule(style="cyan"))
     console.print(Panel(Align.center(f"[bold white]{escape(filename)}[/bold white]"), title="[bold cyan]Processing File[/bold cyan]", border_style="cyan", expand=False))
 
+    # Detect and strip edition tags before parsing the title.
+    original_stem = file_path.stem
+    clean_stem, edition_labels = detect_editions(
+        original_stem, current_config['renamer'].get('edition_tags', []))
+    edition_text = " ".join(edition_labels)
+
     # Check for TV Show pattern first
-    tv_title, season, episode = parse_tv_filename(file_path.stem)
-    
+    tv_title, season, episode = parse_tv_filename(clean_stem)
+
+    if tv_title is not None and not tv_title.strip():
+        fallback_title, fallback_season, fallback_episode = parse_tv_filename(original_stem)
+        if fallback_title and fallback_title.strip():
+            console.print("[bold yellow]Edition tag removed the entire title; keeping the original title and not re-adding the edition.[/bold yellow]")
+            tv_title, season, episode = fallback_title, fallback_season, fallback_episode
+            edition_text = ""
+
     is_tv_show = False
     if tv_title:
         is_tv_show = True
@@ -488,8 +525,18 @@ def process_file(file_path, output_root, log_file, current_config):
         console.print(f"[bold blue]📺 Detected TV Show:[/bold blue] {tv_title} S{season:02d}E{episode:02d}")
     else:
         # Parse as Movie
-        search_title, search_year = parse_filename(file_path.stem)
+        search_title, search_year = parse_filename(clean_stem)
+        if not search_title:
+            fallback_title, fallback_year = parse_filename(original_stem)
+            if fallback_title:
+                console.print("[bold yellow]Edition tag removed the entire title; keeping the original title and not re-adding the edition.[/bold yellow]")
+                search_title = fallback_title
+                search_year = fallback_year or search_year
+                edition_text = ""
         console.print(f"[bold magenta]🎬 Detected Movie:[/bold magenta] {search_title} ({search_year or 'Unknown Year'})")
+
+    if edition_text:
+        console.print(f"[bold cyan]Edition tag:[/bold cyan] {escape(edition_text)}")
 
     # Check cache for TV shows
     imdb_id = None
@@ -645,13 +692,15 @@ def process_file(file_path, output_root, log_file, current_config):
 
              if ep_title:
                  # Construct TV Show filename
-                 show_fmt = current_config['renamer'].get('show_format', "[SHOW_NAME] - S[SEASON]E[EPISODE] - [EPISODE_NAME]")
-                 new_stem = format_show_name(show_fmt, series_title, season, episode, ep_title, res_category, imdb_id, show_year, episode_year)
+                 show_fmt = current_config['renamer'].get('show_format', "[SHOW_NAME] - S[SEASON]E[EPISODE] - [EPISODE_NAME] - [EDITION]")
+                 new_stem = format_show_name(show_fmt, series_title, season, episode, ep_title, res_category, imdb_id, show_year, episode_year, edition=edition_text)
              else:
                  console.print("[bold yellow]Could not fetch episode details.[/bold yellow]")
                  # Fallback: Rename without episode title if episode info is missing
                  # User might prefer this over skipping
                  new_stem = f"{series_title} - S{season:02d}E{episode:02d} - Unknown Episode"
+                 if edition_text:
+                     new_stem += f" - {edition_text}"
                  console.print(f"Renaming with fallback title: {escape(new_stem + file_path.suffix)}")
 
              moved = move_file(file_path, dest_dir, new_stem + file_path.suffix,
@@ -676,8 +725,8 @@ def process_file(file_path, output_root, log_file, current_config):
 
             if original_title and release_year:
                 # Construct the new filename
-                movie_fmt = current_config['renamer'].get('movie_format', "[MOVIE_NAME] ([YEAR]) [[IMDB_ID]] - [RESOLUTION]")
-                new_stem = format_movie_name(movie_fmt, original_title, release_year, imdb_id, res_category)
+                movie_fmt = current_config['renamer'].get('movie_format', "[MOVIE_NAME] ([YEAR]) [[IMDB_ID]] - [EDITION] - [RESOLUTION]")
+                new_stem = format_movie_name(movie_fmt, original_title, release_year, imdb_id, res_category, edition=edition_text)
                 moved = move_file(file_path, Path(output_root), new_stem + file_path.suffix,
                                   log_file, current_config)
                 if moved:

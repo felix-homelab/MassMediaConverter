@@ -30,10 +30,12 @@ The workflow is split into two stages:
   - [Converter settings](#converter-settings)
   - [Renamer settings](#renamer-settings)
 - [Filename placeholders](#filename-placeholders)
+- [Edition handling](#edition-handling)
 - [Supported formats and codecs](#supported-formats-and-codecs)
 - [Logs](#logs)
 - [How it works](#how-it-works)
 - [Troubleshooting](#troubleshooting)
+- [Running tests](#running-tests)
 - [Project layout](#project-layout)
 - [Notes and limitations](#notes-and-limitations)
 
@@ -48,6 +50,7 @@ The workflow is split into two stages:
 - **IMDb ID reuse and verification**: an existing `tt…` ID in the filename is checked against the parsed title/year; a per-season show cache avoids asking for the same show twice.
 - **Resolution detection** via `ffprobe`; the resolution label (e.g. `1080p`) can be embedded in file and folder names.
 - **Automatic folder organisation** for TV shows: `<Show> [ttID] - <resolution>/Staffel <NN>/`.
+- **Edition-aware renaming**: preserves `Director's Cut`, `Extended`, `Remastered` and `Uncut` through the `[EDITION]` placeholder, while safely ignoring other labels and protecting real titles such as *Uncut Gems* and *The Final Cut*.
 - **Sidecar handling**: subtitles and metadata (`.srt`, `.ass`, `.nfo`, images, …) are moved and renamed with their video, preserving language tags such as `.en.srt`.
 - **Collision-safe**: nothing is silently overwritten; duplicates receive a configurable suffix such as ` (2)`.
 - **Batch conversion** with multiple concurrent workers and live per-thread progress.
@@ -234,10 +237,11 @@ All paths are resolved relative to the directory from which the app is started (
 | --- | --- | --- |
 | `renamer.video_extensions` | `.mkv, .mp4, .avi, .mov, .wmv, .flv, .webm, .m4v, .ts` | Files treated as videos by both stages. The converter also uses this list as its input extensions. |
 | `renamer.sidecar_extensions` | `.srt, .ass, .ssa, .vtt, .sub, .idx, .nfo, .jpg, .jpeg, .png, .webp` | Files moved/renamed with a video (and copied by the converter). |
-| `renamer.movie_format` | `"[MOVIE_NAME] ([YEAR]) [[IMDB_ID]] - [RESOLUTION]"` | Movie filename template. |
-| `renamer.show_format` | `"[SHOW_NAME] - S[SEASON]E[EPISODE] - [EPISODE_NAME]"` | TV episode filename template. |
+| `renamer.movie_format` | `"[MOVIE_NAME] ([YEAR]) [[IMDB_ID]] - [EDITION] - [RESOLUTION]"` | Movie filename template. |
+| `renamer.show_format` | `"[SHOW_NAME] - S[SEASON]E[EPISODE] - [EPISODE_NAME] - [EDITION]"` | TV episode filename template. |
 | `renamer.show_folder_format` | `"[SHOW_NAME] [[IMDB_ID]] - [RESOLUTION]"` | Show folder template. |
 | `renamer.season_folder_format` | `"Staffel [SEASON]"` | Season folder template. |
+| `renamer.edition_tags` | `["Director's Cut", "Extended", "Remastered", "Uncut"]` | Allowlist of editions written to `[EDITION]`; order controls the combined order. An empty list disables edition handling. |
 | `renamer.folder_mode` | `"show_folders"` | `show_folders` creates show/season folders for TV; `flat` puts everything directly in the renamer output. |
 | `renamer.collision_suffix` | `" ({n})"` | Suffix used when a destination name already exists. `{n}` is replaced by `2`, `3`, … |
 
@@ -247,6 +251,7 @@ A minimal config:
 
 ```json
 {
+  "config_version": 2,
   "paths": {
     "renamer_input": ".",
     "renamer_output": "out_renamer",
@@ -265,10 +270,11 @@ A minimal config:
   "renamer": {
     "video_extensions": [".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".ts"],
     "sidecar_extensions": [".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".nfo", ".jpg", ".jpeg", ".png", ".webp"],
-    "movie_format": "[MOVIE_NAME] ([YEAR]) [[IMDB_ID]] - [RESOLUTION]",
-    "show_format": "[SHOW_NAME] - S[SEASON]E[EPISODE] - [EPISODE_NAME]",
+    "movie_format": "[MOVIE_NAME] ([YEAR]) [[IMDB_ID]] - [EDITION] - [RESOLUTION]",
+    "show_format": "[SHOW_NAME] - S[SEASON]E[EPISODE] - [EPISODE_NAME] - [EDITION]",
     "show_folder_format": "[SHOW_NAME] [[IMDB_ID]] - [RESOLUTION]",
     "season_folder_format": "Staffel [SEASON]",
+    "edition_tags": ["Director's Cut", "Extended", "Remastered", "Uncut"],
     "folder_mode": "show_folders",
     "collision_suffix": " ({n})"
   }
@@ -286,6 +292,7 @@ A minimal config:
 | `[MOVIE_NAME]` | `Inception` |
 | `[YEAR]` | `2010` |
 | `[IMDB_ID]` | `tt1375666` |
+| `[EDITION]` | `Director's Cut`, `Extended Remastered`, or empty |
 | `[RESOLUTION]` | `1080p` |
 
 ### `renamer.show_format`
@@ -296,6 +303,7 @@ A minimal config:
 | `[SEASON]` | `01` |
 | `[EPISODE]` | `02` |
 | `[EPISODE_NAME]` | `Cat's in the Bag...` |
+| `[EDITION]` | `Extended`, `Uncut Remastered`, or empty |
 | `[RESOLUTION]` | `1080p` |
 | `[IMDB_ID]` | `tt0903747` |
 | `[YEAR]` | show premiere year (e.g. `2008`) |
@@ -319,6 +327,67 @@ Notes:
 - If the resolution cannot be detected, `[RESOLUTION]` becomes `Unknown`; the `- Unknown` suffix is dropped from show folder names.
 - If no IMDb ID is available, an empty `[]` in a folder name is removed.
 - Missing episode titles fall back to `Unknown Episode`.
+
+---
+
+## Edition handling
+
+Editions are detected in the source filename, removed before the IMDb/TVMaze lookup, and re-added to the output through the `[EDITION]` placeholder. The feature is controlled by `renamer.edition_tags`.
+
+### Allowed editions
+
+Default:
+
+```json
+"edition_tags": ["Director's Cut", "Extended", "Remastered", "Uncut"]
+```
+
+- The order controls the combined order when one file carries several editions: `Extended Remastered Uncut`.
+- The configured spelling is used verbatim in the filename (`Director's Cut` keeps its apostrophe).
+- An empty list disables edition handling completely.
+- Custom labels can be added; they match case/punctuation-insensitively, but only the four built-in groups have automatic aliases.
+
+### Built-in aliases
+
+| Canonical | Recognized variants |
+| --- | --- |
+| Director's Cut | `Directors Cut`, `Director Cut`, `DC`, `Director's Cut Edition/Version` |
+| Extended | `Extended Cut`, `Extended Edition`, `Extended Version` |
+| Remastered | `Remaster`, `4K Remaster`, `4K Remastered` |
+| Uncut | `Uncut Version`, `Uncut Edition` |
+
+`DC` and other short aliases only match as standalone tokens, not inside a release-group suffix.
+
+### Detection rules
+
+- **Balanced matching**: an allowed edition is only recognized when it is followed by a release marker (year, resolution, source, codec, audio/HDR/language tag), another edition label, a closing bracket, or the end of the name. This is what keeps *The Extended Family* from being tagged.
+- **Release groups ignored**: a match inside the final `-GROUP` suffix (for example `x264-DC`) is not treated as an edition.
+- **Stripped before lookup**: `Movie.Extended.2020.1080p` searches for `Movie`, then writes `Movie (2020) [tt…] - Extended - 1080p.mkv`.
+- **Empty results are cleaned up**: if no edition is detected, `[EDITION]` and its surrounding separators are removed (`... -  - 1080p` → `... - 1080p`, `()`, `[]`, trailing ` - `).
+- **Fallback**: if stripping removes the entire title (for example a file literally named `Extended 2020.mkv`), the original title is kept and the edition is not re-added.
+
+### Non-allowed labels
+
+Labels such as `Unrated`, `Theatrical`, `IMAX`, `Criterion`, `Special Edition`, `Ultimate Edition`, `Final Cut`, `Open Matte`, `Restored`, `Anniversary Edition`, `Collector's Edition` and `Limited Edition` are never written to `[EDITION]`. They are stripped from the parsed title only when they appear **after the year/episode marker** or inside a tag-only bracket group, which protects titles like *The Final Cut* and *Uncut Gems*.
+
+`Unrated` is intentionally not mapped to `Uncut`.
+
+### Examples
+
+| Source | Output |
+| --- | --- |
+| `Movie.2020.Extended.1080p.mkv` | `Movie (2020) [tt…] - Extended - 1080p.mkv` |
+| `Movie.2020.Directors.Cut.1080p.mkv` | `Movie (2020) [tt…] - Director's Cut - 1080p.mkv` |
+| `Movie.2019.Extended.Remastered.2160p.mkv` | `Movie (2019) [tt…] - Extended Remastered - 2160p.mkv` |
+| `Movie.2020.Uncut.Version.1080p.mkv` | `Movie (2020) [tt…] - Uncut - 1080p.mkv` |
+| `Show.S01E02.Extended.1080p.mkv` | `Show - S01E02 - Episode - Extended.mkv` |
+| `Movie.2020.Unrated.1080p.mkv` | `Movie (2020) [tt…] - 1080p.mkv` *(label dropped)* |
+| `The.Final.Cut.2004.1080p.mkv` | `The Final Cut (2004) [tt…] - 1080p.mkv` *(protected)* |
+| `Uncut.Gems.2019.1080p.mkv` | `Uncut Gems (2019) [tt…] - 1080p.mkv` *(protected)* |
+
+`[EDITION]` works in `movie_format` and `show_format` only; folder formats do not get an edition token. Existing configs are migrated once (version 2) by inserting `[EDITION]` before `[RESOLUTION]`, or appending it when there is no `[RESOLUTION]`.
+
+> **Multi-part files are not split automatically.** Markers such as `CD1`, `Disc 2` or `Part 1` are not treated specially. `Movie.2020.CD1.mkv` and `Movie.2020.CD2.mkv` therefore resolve to the same output name and the second file receives a collision suffix; markers before the year can pollute the search title.
 
 ---
 
@@ -450,6 +519,14 @@ The renamer **moves** files out of the source folder. Back up your source folder
 
 ---
 
+## Running tests
+
+Edition detection and config migration have a small stdlib test suite (no extra dependencies):
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
 ## Project layout
 
 ```text
@@ -464,10 +541,13 @@ MassMediaConverter/
 │   └── conversion_errors.log
 ├── out_renamer/             # Created by the renamer
 ├── out_converter/           # Created by the converter
+├── tests/
+│   └── test_editions.py     # Edition detection + config migration tests
 └── utils/
     ├── util_colors.py       # Clear-screen helper
     ├── util_config.py       # Config schema, loading, migration and menu
     ├── util_converter.py    # Conversion planning, workers and progress UI
+    ├── util_editions.py     # Edition detection, aliases and safe stripping
     ├── util_ffmpeg.py       # FFmpeg probe/command building and codec tables
     ├── util_renamer.py      # Rename flow, sidecars, folders and changelog
     └── util_resolution.py   # Resolution detection and category labels
@@ -482,6 +562,8 @@ Runtime folders (`settings/`, `out_renamer/`, `out_converter/`, `output/`) and P
 - **Internet required** for the renamer: IMDb suggestion API, TVMaze, and Wikidata are queried live. Offline runs will show search errors; files are then skipped.
 - **Interactive**: the renamer asks for a choice per file that has no verified ID.
 - **TV detection is pattern-based**: only `SxxExx` is recognised. Other schemes (e.g. `1x02`) are treated as movies.
+- **Editions are allowlist-based**: only `renamer.edition_tags` (default `Director's Cut`, `Extended`, `Remastered`, `Uncut`) are written to `[EDITION]`; other labels are dropped and removed from the lookup where safe.
+- **No multi-part handling**: `CD1`, `Disc 2`, `Part 1` and similar markers are not detected or preserved, and can collide in the output.
 - **The renamer only scans one folder level**; put files in the renamer input folder itself.
 - **Sidecar matching** is by matching basename or basename plus a dotted tag: `Movie.srt`, `Movie.en.srt`, `Movie.forced.srt`. Files with unrelated names are left alone.
 - **Bitmap subtitles** cannot be stored as text in MP4/MOV; they are skipped with a warning. Use MKV if you need to keep them.
