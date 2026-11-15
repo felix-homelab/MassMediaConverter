@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+
+.serena/
+
+# Runtime data (created by the app)
+settings/
+out_renamer/
+out_converter/
+output/

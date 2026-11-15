@@ -1,9 +1,11 @@
 import os
+import shutil
 import sys
 import time
 import threading
 import logging
-from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn
+from pathlib import Path
+from rich.progress import Progress, BarColumn, TextColumn
 from rich.panel import Panel
 from rich.live import Live
 from rich.table import Table
@@ -18,7 +20,6 @@ console = Console()
 
 # --- Configuration ---
 config = load_config()
-SETTING_CONVERT_TO = config['converter']['convert_to']
 SETTING_THREADS = config['converter']['threads']
 
 if not os.path.exists('settings'):
@@ -35,14 +36,18 @@ logging.basicConfig(
 class ConversionWorker:
     def __init__(self, task_id, input_file, output_file):
         self.task_id = task_id
-        self.input_file = input_file
-        self.name = os.path.basename(input_file)
-        self.output_file = output_file
-        
-        # Pre-fetch media info to avoid calling ffprobe twice (once for frames, once for build_cmd)
-        self.media_info = ffprobe_media_info(input_file)
+        self.input_file = str(input_file)
+        self.output_file = str(output_file)
+        self.name = os.path.basename(self.input_file)
 
-        self.total_frames = get_total_frames(input_file, self.media_info)
+        # Pre-fetch media info to avoid calling ffprobe twice (once for frames, once for build_cmd)
+        self.media_info = ffprobe_media_info(self.input_file)
+
+        output_dir = os.path.dirname(self.output_file)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+        self.total_frames = get_total_frames(self.input_file, self.media_info)
         if self.total_frames == 0: self.total_frames = 1
 
         self.current_frame = 0
@@ -128,27 +133,217 @@ def truncate_filename(filename, max_length=40, offset=0):
     else:
         return filename + ' ' * (max_length - len(filename))
 
+def _resolve_path(value):
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else (Path.cwd() / path)
+
+
+def _collect_input_files(input_root, output_root, extensions):
+    """Recursively collect convertible files below input_root.
+
+    The output folder is never scanned, even when it is nested inside the
+    input folder.
+    """
+    input_root = Path(input_root)
+    output_root = Path(output_root).resolve()
+    found = []
+
+    for root, dirs, filenames in os.walk(input_root):
+        current = Path(root)
+        dirs[:] = sorted(
+            d for d in dirs
+            if (current / d).resolve() != output_root
+        )
+        for filename in filenames:
+            if filename.startswith('.'):
+                continue
+            path = current / filename
+            if path.suffix.lower() in extensions and path.is_file():
+                found.append(path)
+
+    return sorted(found, key=lambda p: str(p).lower())
+
+
+def _reserve_destination(destination, reserved, collision_format, avoid_existing):
+    """Make sure two planned jobs never write to the same output file."""
+    candidate = destination
+    number = 2
+    while candidate in reserved or (avoid_existing and candidate.exists()):
+        if "{n}" in collision_format:
+            addition = collision_format.replace("{n}", str(number))
+        else:
+            addition = f"{collision_format}{number}"
+        candidate = destination.with_name(f"{destination.stem}{addition}{destination.suffix}")
+        number += 1
+    reserved.add(candidate)
+    return candidate
+
+
+def _sidecar_files(source, sidecar_extensions):
+    """Find subtitle/metadata files that belong to `source`.
+
+    Matches "Movie.srt" and language-tagged files such as "Movie.en.srt".
+    Returns a list of (path, remainder) tuples.
+    """
+    stem = source.stem
+    matches = []
+
+    try:
+        entries = list(source.parent.iterdir())
+    except OSError:
+        return matches
+
+    for entry in entries:
+        if not entry.is_file() or entry == source:
+            continue
+        if entry.suffix.lower() not in sidecar_extensions:
+            continue
+
+        entry_stem_lower = entry.stem.lower()
+        stem_lower = stem.lower()
+        if entry_stem_lower == stem_lower:
+            remainder = ""
+        elif entry_stem_lower.startswith(stem_lower + "."):
+            remainder = entry.stem[len(stem):]
+        else:
+            continue
+
+        matches.append((entry, remainder))
+
+    return matches
+
+
+def collect_conversion_jobs(config=None, input_root=None, output_root=None):
+    """Plan the conversions.
+
+    Returns (jobs, skipped_existing, sidecar_copies):
+      * jobs             - (source_path, destination_path) video conversions
+      * skipped_existing - sources whose output file already exists
+      * sidecar_copies   - (source_path, destination_path) sidecar copies
+    """
+    if config is None:
+        config = load_config()
+
+    converter = config['converter']
+    renamer = config['renamer']
+
+    extension = f".{converter['convert_to'].lstrip('.').lower()}"
+    mirror = converter.get('mirror_input_structure', True)
+    skip_existing = converter.get('skip_existing', True)
+    collision_format = converter.get('collision_suffix', ' ({n})')
+
+    if input_root is None:
+        input_root = _resolve_path(config['paths']['converter_input'])
+    if output_root is None:
+        output_root = _resolve_path(config['paths']['converter_output'])
+    input_root = Path(input_root)
+    output_root = Path(output_root)
+
+    extensions = {e.lower() for e in renamer.get('video_extensions', [])}
+    sidecar_extensions = {e.lower() for e in renamer.get('sidecar_extensions', [])}
+    sources = _collect_input_files(input_root, output_root, extensions)
+
+    jobs = []
+    skipped_existing = []
+    sidecar_copies = []
+    reserved = set()
+
+    for source in sources:
+        relative = source.relative_to(input_root)
+        if mirror:
+            destination = output_root / relative.with_suffix(extension)
+        else:
+            destination = output_root / (source.stem + extension)
+
+        if skip_existing and destination.exists():
+            final_destination = destination
+            skipped_existing.append(source)
+        else:
+            final_destination = _reserve_destination(
+                destination, reserved, collision_format, skip_existing)
+            jobs.append((source, final_destination))
+
+        # Sidecars follow the video name and live in the same output folder.
+        for sidecar, remainder in _sidecar_files(source, sidecar_extensions):
+            target = final_destination.with_name(
+                f"{final_destination.stem}{remainder}{sidecar.suffix}")
+            if skip_existing and target.exists():
+                continue
+            target = _reserve_destination(
+                target, reserved, collision_format, skip_existing)
+            sidecar_copies.append((sidecar, target))
+
+    return jobs, skipped_existing, sidecar_copies
+
+
+def copy_sidecars(sidecar_copies):
+    """Copy planned sidecars. Returns (copied_count, failures)."""
+    copied = 0
+    failures = []
+    for source, target in sidecar_copies:
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            copied += 1
+        except OSError as e:
+            failures.append((source, str(e)))
+            logging.warning(f"FILE: {source}\nSTATUS: Could not copy sidecar\nERROR: {e}\n{'-' * 40}")
+    return copied, failures
+
+
+def _pause():
+    console.print()
+    try:
+        console.input("[bold yellow]Press Enter to continue...[/bold yellow]")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
+def _report_sidecars(copied, failures):
+    if copied:
+        console.print(f"[bold green]Copied {copied} sidecar file(s) to the output folder.[/bold green]")
+    if failures:
+        console.print(
+            f"[bold yellow]Could not copy {len(failures)} sidecar file(s); see 'conversion_errors.log'.[/bold yellow]")
+
+
 def run_converter():
     # Reload config in case it changed
-    global SETTING_CONVERT_TO, SETTING_THREADS
+    global SETTING_THREADS
     config = load_config()
-    SETTING_CONVERT_TO = config['converter']['convert_to']
-    SETTING_THREADS = config['converter']['threads']
+    SETTING_THREADS = max(1, int(config['converter']['threads']))
 
     clear_screen()
 
-    if not os.path.exists('output'):
-        os.makedirs('output')
+    input_root = _resolve_path(config['paths']['converter_input'])
+    output_root = _resolve_path(config['paths']['converter_output'])
 
-    files_to_convert = []
-    extensions = ('.mkv', '.avi', '.mp4', '.mov', '.flv')
-    
-    # Sort files to ensure consistent order
-    all_files = sorted(os.listdir())
-    
-    for f in all_files:
-        if f.lower().endswith(extensions):
-            files_to_convert.append((f, os.path.join('output', os.path.splitext(f)[0] + f'.{SETTING_CONVERT_TO}')))
+    console.print(f"[bold]Input folder:[/bold]  {escape(str(input_root))}")
+    console.print(f"[bold]Output folder:[/bold] {escape(str(output_root))}")
+
+    if not input_root.exists() or not input_root.is_dir():
+        console.print(f"[bold red]Input folder not found: {escape(str(input_root))}[/bold red]")
+        console.print("[bold yellow]Run the Media Renamer first so this folder is created.[/bold yellow]")
+        _pause()
+        return
+
+    if input_root.resolve() == output_root.resolve():
+        console.print("[bold red]Input and output folders must be different.[/bold red]")
+        _pause()
+        return
+
+    try:
+        output_root.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        console.print(f"[bold red]Error creating output folder: {e}[/bold red]")
+        _pause()
+        return
+
+    files_to_convert, skipped_existing, sidecar_copies = collect_conversion_jobs(
+        config, input_root, output_root)
+
+    # External subtitles/metadata are copied next to their converted video.
+    copied_sidecars, failed_sidecars = copy_sidecars(sidecar_copies)
 
     total_files = len(files_to_convert)
     current_file_idx = 0
@@ -160,7 +355,14 @@ def run_converter():
     warning_files = []
 
     if total_files == 0:
-        console.print("[bold yellow]No files found.[/bold yellow]")
+        if skipped_existing:
+            console.print(
+                f"[bold yellow]All {len(skipped_existing)} file(s) are already converted.[/bold yellow]")
+        else:
+            console.print(
+                f"[bold yellow]No files found in {escape(str(input_root))}.[/bold yellow]")
+        _report_sidecars(copied_sidecars, failed_sidecars)
+        _pause()
         return
 
     # Create a Progress instance for the overall progress
@@ -231,8 +433,8 @@ def run_converter():
                             break
                     
                     if available_slot != -1:
-                        file_info = files_to_convert[current_file_idx]
-                        worker = ConversionWorker(current_file_idx + 1, file_info[0], file_info[1])
+                        source_file, output_file = files_to_convert[current_file_idx]
+                        worker = ConversionWorker(current_file_idx + 1, source_file, output_file)
                         worker.thread_index = available_slot # Assign slot
                         
                         # Update slot state
@@ -330,4 +532,12 @@ def run_converter():
     else:
         console.print('[bold green]Done! All files converted perfectly.[/bold green]')
 
-    os.system('pause')
+    if skipped_existing:
+        console.print(
+            f"[bold yellow]Skipped {len(skipped_existing)} already-converted file(s).[/bold yellow]")
+
+    _report_sidecars(copied_sidecars, failed_sidecars)
+
+    console.print(f"[bold green]Output written to:[/bold green] {escape(str(output_root))}")
+
+    _pause()

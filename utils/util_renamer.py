@@ -1,9 +1,15 @@
 import os
 import re
+import shutil
 import requests
 import urllib.parse
 from pathlib import Path
-import pyperclip
+
+try:
+    import pyperclip
+except ImportError:  # Clipboard support is a convenience only
+    pyperclip = None
+
 from difflib import SequenceMatcher
 from rich.console import Console
 from rich.prompt import Prompt
@@ -20,6 +26,7 @@ console = Console()
 
 # Load config
 VIDEO_EXTENSIONS = set(load_config()['renamer']['video_extensions'])
+SIDECAR_EXTENSIONS = set(load_config()['renamer']['sidecar_extensions'])
 
 # Cache for show IDs to avoid re-asking for the same show
 # Key: (show_title, season) -> Value: imdb_id
@@ -255,27 +262,158 @@ def search_movie_suggestion(title, year=None, kind_priority='feature'):
         return None
 
 
-def rename_file(file_path, out_title, log_file, dest_dir=None):
-    # Sanitize filename to remove illegal characters
-    out_title = re.sub(r'[<>:"/\\|?*]', '', out_title)
+def sanitize_component(name):
+    """Remove characters that are invalid in file/folder names and tidy whitespace."""
+    if not name:
+        return ""
+    name = re.sub(r'[<>:"/\\|?*]', '', name)
+    name = " ".join(name.split())
+    # Windows does not allow names to end with a space or a dot
+    return name.strip(" .")
 
-    if dest_dir is not None:
-        out_path = dest_dir / out_title
-        display_name = f"{dest_dir.parent.name}/{dest_dir.name}/{out_title}"
+
+def display_path(path):
+    """Return a path relative to the working directory when possible."""
+    try:
+        return str(path.relative_to(Path.cwd()))
+    except ValueError:
+        return str(path)
+
+
+def unique_path(dest_dir, filename, collision_format):
+    """Return a path inside dest_dir that does not exist yet.
+
+    The configured collision suffix (e.g. " ({n})") is inserted before the
+    extension when the same name is already taken.
+    """
+    candidate = dest_dir / filename
+    if not candidate.exists():
+        return candidate
+
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+    number = 2
+    while True:
+        if "{n}" in collision_format:
+            addition = collision_format.replace("{n}", str(number))
+        else:
+            addition = f"{collision_format}{number}"
+        candidate = dest_dir / f"{stem}{addition}{suffix}"
+        if not candidate.exists():
+            return candidate
+        number += 1
+
+
+def move_file(src, dest_dir, new_name, log_file, current_config, announce=True):
+    """Move `src` into `dest_dir` using `new_name`, never overwriting anything.
+
+    Returns the final destination path, or None if the move failed.
+    """
+    new_name = sanitize_component(new_name)
+    if not new_name:
+        console.print(f"[bold red]Cannot move {escape(src.name)}: resulting name is empty.[/bold red]")
+        return None
+
+    dest_dir = Path(dest_dir)
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        collision_format = current_config['renamer'].get('collision_suffix', ' ({n})')
+        dest = unique_path(dest_dir, new_name, collision_format)
+        shutil.move(str(src), str(dest))
+    except OSError as e:
+        console.print(f"[bold red]Error moving file: {e}[/bold red]")
+        return None
+
+    shown = display_path(dest)
+    log_file.write(f"{shown}\n")
+    log_file.flush()  # Ensure it's written to disk immediately
+
+    if announce:
+        console.print(Panel(f"[bold green]{escape(shown)}[/bold green]", title="Renamed Success", border_style="green"))
     else:
-        out_path = file_path.with_name(out_title)
-        display_name = out_title
+        console.print(f"  [green]+ {escape(shown)}[/green]")
+
+    return dest
+
+
+def find_sidecars(video_path, sidecar_extensions):
+    """Find subtitle/metadata files that belong to a video.
+
+    Matches "Movie.srt" and language-tagged files such as "Movie.en.srt".
+    Returns a list of (path, remainder) tuples, where remainder is the
+    ".en" style part that must be preserved in the new filename.
+    """
+    stem = video_path.stem
+    matches = []
 
     try:
-        file_path.rename(out_path)
+        entries = list(video_path.parent.iterdir())
+    except OSError:
+        return matches
 
-        log_entry = f"{display_name}\n"
-        log_file.write(log_entry)
-        log_file.flush()  # Ensure it's written to disk immediately
+    for entry in entries:
+        if not entry.is_file() or entry == video_path:
+            continue
+        if entry.suffix.lower() not in sidecar_extensions:
+            continue
 
-        console.print(Panel(f"[bold green]{escape(display_name)}[/bold green]", title="Renamed Success", border_style="green"))
-    except OSError as e:
-        console.print(f"[bold red]Error renaming file: {e}[/bold red]")
+        entry_stem_lower = entry.stem.lower()
+        stem_lower = stem.lower()
+        if entry_stem_lower == stem_lower:
+            remainder = ""
+        elif entry_stem_lower.startswith(stem_lower + "."):
+            remainder = entry.stem[len(stem):]
+        else:
+            continue
+
+        matches.append((entry, remainder))
+
+    return matches
+
+
+def move_sidecars(source_video, moved_video, log_file, current_config):
+    """Move sidecars next to the renamed video, keeping their extra suffixes."""
+    moved = []
+    for sidecar, remainder in find_sidecars(source_video, SIDECAR_EXTENSIONS):
+        new_name = f"{moved_video.stem}{remainder}{sidecar.suffix}"
+        dest = move_file(sidecar, moved_video.parent, new_name, log_file,
+                         current_config, announce=False)
+        if dest:
+            moved.append(dest)
+    return moved
+
+
+def build_show_folder(output_root, show_name, imdb_id, season, episode, resolution, current_config):
+    """Build (but do not create) the show/season folder for a TV episode."""
+    renamer = current_config['renamer']
+    folder_fmt = renamer.get('show_folder_format', "[SHOW_NAME] [[IMDB_ID]] - [RESOLUTION]")
+    season_fmt = renamer.get('season_folder_format', "Staffel [SEASON]")
+
+    def fill(fmt):
+        return fmt.replace("[SHOW_NAME]", show_name)\
+                  .replace("[SEASON]", f"{season:02d}")\
+                  .replace("[EPISODE]", f"{episode:02d}")\
+                  .replace("[IMDB_ID]", imdb_id or "")\
+                  .replace("[RESOLUTION]", resolution)
+
+    folder_name = fill(folder_fmt)
+    season_name = fill(season_fmt)
+
+    # Drop an empty [IMDB_ID] placeholder when no ID was found
+    folder_name = folder_name.replace("[]", "")
+    if resolution == "Unknown":
+        folder_name = re.sub(r'\s*-\s*Unknown\s*$', '', folder_name)
+
+    folder_name = sanitize_component(" ".join(folder_name.split()))
+    season_name = sanitize_component(" ".join(season_name.split()))
+
+    if not folder_name:
+        folder_name = "Unknown Show"
+    if not season_name:
+        season_name = f"Staffel {season:02d}"
+
+    return Path(output_root) / folder_name / season_name
+
 
 def format_movie_name(format_str, movie_name, year, imdb_id, resolution):
     """
@@ -304,36 +442,6 @@ def format_show_name(format_str, show_name, season, episode, episode_name, resol
                      .replace("[SHOW_YEAR]", year_val)\
                      .replace("[EPISODE_YEAR]", ep_year_val)
 
-def build_show_folder(base_dir, show_name, imdb_id, season, episode, resolution, current_config):
-    """
-    Create and return the destination folder for a TV show episode,
-    e.g. "Dexter [tt0773262] - 1080p/Staffel 01".
-    """
-    folder_fmt = current_config['renamer'].get('show_folder_format', "[SHOW_NAME] [[IMDB_ID]] - [RESOLUTION]")
-    season_fmt = current_config['renamer'].get('season_folder_format', "Staffel [SEASON]")
-
-    def fill(fmt):
-        return fmt.replace("[SHOW_NAME]", show_name)\
-                  .replace("[SEASON]", f"{season:02d}")\
-                  .replace("[EPISODE]", f"{episode:02d}")\
-                  .replace("[RESOLUTION]", resolution)\
-                  .replace("[IMDB_ID]", imdb_id)
-
-    folder_name = fill(folder_fmt)
-    season_name = fill(season_fmt)
-
-    # Skip an unknown resolution in the folder name
-    if resolution == "Unknown":
-        folder_name = re.sub(r'\s*-\s*Unknown\s*$', '', folder_name)
-
-    # Sanitize folder names to remove illegal characters
-    folder_name = re.sub(r'[<>:"/\\|?*]', '', folder_name)
-    season_name = re.sub(r'[<>:"/\\|?*]', '', season_name)
-
-    dest_dir = base_dir / folder_name / season_name
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    return dest_dir
-
 def check_similarity(name1, name2):
     """
     Check if two names are similar.
@@ -355,9 +463,9 @@ def check_similarity(name1, name2):
     ratio = SequenceMatcher(None, n1, n2).ratio()
     return ratio >= 0.8
 
-def process_file(file_path, log_file, current_config):
+def process_file(file_path, output_root, log_file, current_config):
     """
-    Process a single file: search/ask for ID, rename, and log.
+    Process a single file: search/ask for ID, move it into output_root, and log.
     """
     # Skip if not a video file
     if file_path.suffix.lower() not in VIDEO_EXTENSIONS:
@@ -434,8 +542,12 @@ def process_file(file_path, log_file, current_config):
                 console.print("[bold red]Could not fetch info for existing ID. Proceeding to search.[/bold red]")
 
     if not imdb_id:
-        # Copy the cleaned name to clipboard
-        pyperclip.copy(search_title)
+        # Copy the cleaned name to clipboard (only if a clipboard is available)
+        if pyperclip is not None:
+            try:
+                pyperclip.copy(search_title)
+            except Exception:
+                pass
 
         # Efficiency Boost: Auto-search for the movie/show
         kind = 'tv series' if is_tv_show else 'feature'
@@ -518,26 +630,34 @@ def process_file(file_path, log_file, current_config):
              # FIX: Ensure we never lose the show name
              if not series_title:
                  series_title = tv_title  # keep parsed filename title instead of None
-             
+
              # Clean series title to avoid invalid characters
              if series_title:
-                 series_title = series_title.replace(":", "-")
+                 series_title = sanitize_component(series_title.replace(":", "-"))
+             if not series_title:
+                 series_title = "Unknown Show"
 
-             # Sort episodes into a show folder with a season subfolder
-             dest_dir = build_show_folder(file_path.parent, series_title, imdb_id, season, episode, res_category, current_config)
+             if current_config['renamer'].get('folder_mode', 'show_folders') == 'show_folders':
+                 dest_dir = build_show_folder(output_root, series_title, imdb_id, season,
+                                              episode, res_category, current_config)
+             else:
+                 dest_dir = Path(output_root)
 
              if ep_title:
                  # Construct TV Show filename
                  show_fmt = current_config['renamer'].get('show_format', "[SHOW_NAME] - S[SEASON]E[EPISODE] - [EPISODE_NAME]")
-                 out_title = format_show_name(show_fmt, series_title, season, episode, ep_title, res_category, imdb_id, show_year, episode_year) + file_path.suffix
-                 rename_file(file_path, out_title, log_file, dest_dir)
+                 new_stem = format_show_name(show_fmt, series_title, season, episode, ep_title, res_category, imdb_id, show_year, episode_year)
              else:
                  console.print("[bold yellow]Could not fetch episode details.[/bold yellow]")
                  # Fallback: Rename without episode title if episode info is missing
                  # User might prefer this over skipping
-                 fallback_title = f"{series_title} - S{season:02d}E{episode:02d} - Unknown Episode{file_path.suffix}"
-                 console.print(f"Renaming with fallback title: {escape(fallback_title)}")
-                 rename_file(file_path, fallback_title, log_file, dest_dir)
+                 new_stem = f"{series_title} - S{season:02d}E{episode:02d} - Unknown Episode"
+                 console.print(f"Renaming with fallback title: {escape(new_stem + file_path.suffix)}")
+
+             moved = move_file(file_path, dest_dir, new_stem + file_path.suffix,
+                               log_file, current_config)
+             if moved:
+                 move_sidecars(file_path, moved, log_file, current_config)
 
         else:
             # Movie: reuse title/year from the selected suggestion when available,
@@ -552,50 +672,75 @@ def process_file(file_path, log_file, current_config):
                     original_title, release_year = get_movie_info(imdb_id)
 
             if original_title:
-                original_title = original_title.replace(":", "-")
+                original_title = sanitize_component(original_title.replace(":", "-"))
 
             if original_title and release_year:
                 # Construct the new filename
                 movie_fmt = current_config['renamer'].get('movie_format', "[MOVIE_NAME] ([YEAR]) [[IMDB_ID]] - [RESOLUTION]")
-                out_title = format_movie_name(movie_fmt, original_title, release_year, imdb_id, res_category) + file_path.suffix
-                rename_file(file_path, out_title, log_file)
+                new_stem = format_movie_name(movie_fmt, original_title, release_year, imdb_id, res_category)
+                moved = move_file(file_path, Path(output_root), new_stem + file_path.suffix,
+                                  log_file, current_config)
+                if moved:
+                    move_sidecars(file_path, moved, log_file, current_config)
             else:
                 console.print("[bold red]Movie not found or error occurred.[/bold red]")
     else:
         console.print("[bold yellow]No ID provided. Skipping.[/bold yellow]")
 
 
+def _resolve_path(value):
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else (Path.cwd() / path)
+
+
 def run_renamer():
     """
     Main function to rename video files based on IMDb metadata.
+
+    Renamed files (and their sidecars) are moved into the configured
+    renamer output folder, e.g. "out_renamer".
     """
-    # Reload config
-    global VIDEO_EXTENSIONS
+    # Reload config in case it changed
+    global VIDEO_EXTENSIONS, SIDECAR_EXTENSIONS
     config = load_config()
     VIDEO_EXTENSIONS = set(config['renamer']['video_extensions'])
+    SIDECAR_EXTENSIONS = set(config['renamer']['sidecar_extensions'])
 
-    # Use current working directory instead of asking for input
-    folder_path = Path.cwd()
-    console.print(Rule(title=f"[bold green]Scanning directory: {folder_path}[/bold green]"))
+    input_dir = _resolve_path(config['paths']['renamer_input'])
+    output_dir = _resolve_path(config['paths']['renamer_output'])
 
-    # Check if the folder exists (it should, since it's CWD)
-    if not folder_path.exists() or not folder_path.is_dir():
-        console.print("[bold red]Error: Current directory is invalid.[/bold red]")
+    console.print(Rule(title="[bold green]Media Renamer[/bold green]"))
+    console.print(f"[bold]Input folder:[/bold]  {escape(str(input_dir))}")
+    console.print(f"[bold]Output folder:[/bold] {escape(str(output_dir))}")
+
+    if not input_dir.exists() or not input_dir.is_dir():
+        console.print("[bold red]Error: Input folder does not exist.[/bold red]")
         return
-        
-    # Ensure settings directory exists for changelog
-    if not os.path.exists('settings'):
-        os.makedirs('settings')
 
-    # Save changelog in the settings directory
-    changelog_path = folder_path / "settings/renamer_changelog.txt"
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        console.print(f"[bold red]Error creating output folder: {e}[/bold red]")
+        return
+
+    # Ensure settings directory exists for the changelog
+    os.makedirs('settings', exist_ok=True)
+    changelog_path = Path('settings/renamer_changelog.txt')
+
+    # Only top-level video files are processed; the output folder is never re-scanned.
+    files = sorted(
+        [f for f in input_dir.iterdir()
+         if f.is_file() and not f.name.startswith('.') and f.suffix.lower() in VIDEO_EXTENSIONS],
+        key=lambda x: x.name.lower()
+    )
+
+    if not files:
+        console.print("[bold yellow]No video files found to rename.[/bold yellow]")
+        return
 
     # Open log file using 'with' to ensure it closes
     with open(changelog_path, "a", encoding="utf-8") as log_out:
-        # Iterate over files in directory
-        # Sort files to process them in order
-        files = sorted([f for f in folder_path.iterdir() if f.is_file()], key=lambda x: x.name.lower())
         for file_path in files:
-            process_file(file_path, log_out, config)
+            process_file(file_path, output_dir, log_out, config)
 
-    console.print(f"\n[bold green]All files processed. Changelog saved.[/bold green]")
+    console.print(f"\n[bold green]All files processed. Changelog saved to {changelog_path}.[/bold green]")

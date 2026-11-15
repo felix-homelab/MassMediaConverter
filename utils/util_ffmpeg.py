@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 from rich.console import Console
 from utils.util_config import load_config
@@ -107,7 +108,11 @@ def get_total_frames(file_path, media_info=None):
     
     if not info: return 0
 
-    video_stream = next((s for s in info.get('streams', []) if s['codec_type'] == 'video'), None)
+    video_stream = next(
+        (s for s in info.get('streams', [])
+         if s['codec_type'] == 'video' and s.get('disposition', {}).get('attached_pic', 0) != 1),
+        None
+    )
     if not video_stream: return 0
 
     if 'nb_frames' in video_stream and video_stream['nb_frames'] != 'N/A':
@@ -147,7 +152,7 @@ def ffmpeg_build_cmd(input_file: str, output_file: str, media_info=None):
     target_res_label = config['converter'].get('resolution', 'original')
     scaling_mode = config['converter'].get('scaling_mode', 'both')
 
-    output_type = output_file.split('.')[-1].lower()
+    output_type = os.path.splitext(output_file)[1].lstrip('.').lower()
     
     if media_info:
         info = media_info

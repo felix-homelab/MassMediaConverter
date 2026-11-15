@@ -54,7 +54,10 @@ def main_menu():
 
         if choice == '1':
             run_renamer()
-            Prompt.ask("[bold yellow]Press Enter to continue...[/bold yellow]")
+            try:
+                console.input("[bold yellow]Press Enter to continue...[/bold yellow]")
+            except (EOFError, KeyboardInterrupt):
+                pass
         elif choice == '2':
             run_converter()
         elif choice == '3':
